@@ -2999,38 +2999,54 @@ impl Game<'_> {
 
     /// Handle one LSS custom payload; inject columns when decode succeeds.
     fn on_lss_payload(&mut self, channel: &str, data: &[u8]) {
-        let Some(remote) = self.remote.as_mut() else {
-            return;
-        };
-        match remote.lss.on_payload(channel, data) {
-            Ok(Some(frame)) => {
-                remote.lss.received += 1;
-                if let Some(lod) = self.lod.as_mut() {
-                    if let Err(e) = horizon_client::lss::ingest_frame(lod, &frame) {
-                        log::debug!("lss ingest: {e}");
-                    }
-                } else {
-                    // Ensure far terrain exists for remote LSS feeds.
-                    self.prepare_lod();
-                    if let Some(lod) = self.lod.as_mut()
-                        && let Err(e) = horizon_client::lss::ingest_frame(lod, &frame)
-                    {
-                        log::debug!("lss ingest: {e}");
-                    }
+        let frame = {
+            let Some(remote) = self.remote.as_mut() else {
+                return;
+            };
+            match remote.lss.on_payload(channel, data) {
+                Ok(Some(frame)) => {
+                    remote.lss.received += 1;
+                    Some(frame)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    log::debug!("lss payload {channel}: {e}");
+                    None
                 }
             }
-            Ok(None) => {}
-            Err(e) => log::debug!("lss payload {channel}: {e}"),
+        };
+        if let Some(frame) = frame {
+            let protocol = self
+                .remote
+                .as_ref()
+                .and_then(|r| r.lss.session.as_ref())
+                .map(|s| s.protocol)
+                .unwrap_or(horizon_client::lss::PROTOCOL_VERSION);
+            if self.lod.is_none() {
+                self.prepare_lod();
+            }
+            if let Some(lod) = self.lod.as_mut() {
+                let ctx = horizon_client::lss::LssIngestContext {
+                    registry: self.pack.assets.registry,
+                    biomes: self.res.biomes(),
+                    facts: self.res.facts(),
+                    protocol,
+                };
+                if let Err(e) = horizon_client::lss::ingest_frame(lod, &frame, &ctx) {
+                    log::debug!("lss ingest: {e}");
+                }
+            }
         }
         self.flush_lss();
     }
 
     /// Send queued LSS custom payloads on the play connection.
     pub(super) fn flush_lss(&mut self) {
-        let Some(remote) = self.remote.as_mut() else {
-            return;
+        let pending: Vec<(String, Vec<u8>)> = match self.remote.as_mut() {
+            Some(remote) => remote.lss.out.drain(..).collect(),
+            None => return,
         };
-        while let Some((channel, data)) = remote.lss.out.pop_front() {
+        for (channel, data) in pending {
             self.send(S::CustomPayload(
                 horizon_protocol::packets::configuration::CustomPayload { channel, data },
             ));

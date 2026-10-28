@@ -5,10 +5,19 @@
 //! Voxy-server-side / LSS terrain — not the Horizon-only `horizon:mod_net` path.
 //!
 //! Protocol details: Hoxy `docs/lss-wire-contract.md`.
-use crate::lod::{self, Column, Lod};
+mod wire_section;
+
+use crate::{
+    biome::Biomes,
+    chunk::{self, Chunk, Light, Section, MIN_Y, SECTIONS},
+    blocks::BlockFacts,
+    lod::{self, block_state_kinds, lod_columns_from_chunk_kinds, Column, Lod},
+};
 use horizon_protocol::buf::{Reader, Writer};
+use horizon_world::registry::{BlockRegistry, BlockStateId};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use wire_section::{Layout, WireColumn};
 
 pub const PROTOCOL_VERSION: i32 = 20;
 pub const CAP_VOXEL_COLUMNS: i32 = 1;
@@ -211,21 +220,206 @@ impl LssClient {
     }
 }
 
-/// Convert LSS section bytes into Horizon LOD columns.
-///
-/// **v1 stub:** returns empty columns until the WireSectionCursor port lands.
-/// Callers still inject so the pipeline is wired; terrain fill comes next.
-pub fn sections_to_lod_columns(_section_bytes: &[u8], _codec: u8) -> Result<[Column; 256], String> {
-    if _codec != 0 {
+/// Registry + biome context for turning LSS identities into Horizon ids.
+pub struct LssIngestContext<'a> {
+    pub registry: &'static BlockRegistry,
+    pub biomes: &'a Biomes,
+    pub facts: &'a BlockFacts,
+    /// Session protocol from `lss:session_config` (selects section body layout).
+    pub protocol: i32,
+}
+
+fn section_body_layout(protocol: i32) -> Layout {
+    if protocol >= PROTOCOL_VERSION {
+        Layout::V20
+    } else {
+        Layout::Native
+    }
+}
+
+/// Convert LSS section bytes into Horizon LOD columns (RAW codec only for now).
+pub fn sections_to_lod_columns(
+    section_bytes: &[u8],
+    codec: u8,
+    ctx: &LssIngestContext<'_>,
+) -> Result<[Column; 256], String> {
+    if codec != 0 {
         return Err("lss: zstd columns not decoded yet".into());
     }
-    // Placeholder: empty air columns (valid blob / inject shape).
-    Ok(std::array::from_fn(|_| Column::default()))
+    let layout = section_body_layout(ctx.protocol);
+    let wire = wire_section::parse(section_bytes, layout)?;
+    let kinds = block_state_kinds(ctx.facts);
+    let chunk = wire_column_to_chunk(&wire, layout, ctx)?;
+    let arc = lod_columns_from_chunk_kinds(&chunk, &kinds);
+    let mut out = std::array::from_fn(|_| Column::default());
+    out.clone_from_slice(arc.as_ref());
+    Ok(out)
+}
+
+fn wire_column_to_chunk(
+    column: &WireColumn,
+    layout: Layout,
+    ctx: &LssIngestContext<'_>,
+) -> Result<Chunk, String> {
+    let mut chunk = Chunk::empty(0, 0);
+    let min_section_y = MIN_Y / 16;
+    let stone = terminal_block(ctx);
+
+    for section in &column.sections {
+        let section_idx = i32::from(section.section_y) - min_section_y;
+        if !(0..SECTIONS as i32).contains(&section_idx) {
+            continue;
+        }
+        let si = section_idx as usize;
+        let blocks = wire_section::resolve_container(
+            &section.blocks,
+            wire_section::BLOCK_ENTRIES,
+            layout,
+            &column.dictionary,
+            |entry| resolve_block_palette_entry(entry, layout, &column.dictionary, ctx, stone),
+        )?;
+        let biomes = wire_section::resolve_container(
+            &section.biomes,
+            wire_section::BIOME_ENTRIES,
+            layout,
+            &column.dictionary,
+            |entry| resolve_biome_palette_entry(entry, layout, &column.dictionary, ctx),
+        )?;
+        let mut values = [0u32; 4096];
+        for (i, &v) in blocks.iter().enumerate() {
+            values[i] = v;
+        }
+        let mut section_data = Section {
+            blocks: Section::from_blocks(&values),
+            biomes: {
+                let mut biome_vals = [0u32; 64];
+                for (i, &b) in biomes.iter().enumerate() {
+                    biome_vals[i] = b;
+                }
+                horizon_core::paletted::PalettedContainer::from_values(chunk::BIOME_STRATEGY, &biome_vals)
+            },
+            light: merge_section_light(section.block_light.as_deref(), section.sky_light.as_deref()),
+        };
+        if let Light::Full(boxed) = &mut section_data.light {
+            // Keep sky at full bright above terrain when the server omitted sky light
+            // (no-sky dimensions still carry block light only).
+            if section.sky_light.is_none() {
+                for byte in boxed.iter_mut() {
+                    *byte = (*byte & 0x0f) | 0xf0;
+                }
+            }
+        }
+        chunk.sections[si] = Arc::new(section_data);
+    }
+    Ok(chunk)
+}
+
+fn merge_section_light(block: Option<&[u8]>, sky: Option<&[u8]>) -> Light {
+    if block.is_none() && sky.is_none() {
+        return Light::Uniform(0xF0);
+    }
+    let mut out = Box::new([0xF0u8; 4096]);
+    for i in 0..4096 {
+        let block_n = block.map(|layer| nibble_at(layer, i)).unwrap_or(0);
+        let sky_n = sky.map(|layer| nibble_at(layer, i)).unwrap_or(0xF);
+        out[i] = u8::from(sky_n << 4) | block_n;
+    }
+    Light::Full(out)
+}
+
+fn nibble_at(layer: &[u8], index: usize) -> u8 {
+    let byte = layer[index >> 1];
+    if index & 1 == 0 {
+        byte & 0x0f
+    } else {
+        byte >> 4
+    }
+}
+
+fn terminal_block(ctx: &LssIngestContext<'_>) -> BlockStateId {
+    ctx.registry
+        .default_state("minecraft:stone")
+        .unwrap_or(ctx.facts.air)
+}
+
+fn resolve_block_palette_entry(
+    entry: i32,
+    layout: Layout,
+    dictionary: &[String],
+    ctx: &LssIngestContext<'_>,
+    stone: BlockStateId,
+) -> u32 {
+    let id = match layout {
+        Layout::Native => BlockStateId(entry as u32),
+        Layout::V20 => {
+            let identity = dictionary
+                .get(entry as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            resolve_block_identity(ctx.registry, identity).unwrap_or(stone)
+        }
+    };
+    id.0
+}
+
+fn resolve_biome_palette_entry(
+    entry: i32,
+    layout: Layout,
+    dictionary: &[String],
+    ctx: &LssIngestContext<'_>,
+) -> u32 {
+    match layout {
+        Layout::Native => entry as u32,
+        Layout::V20 => {
+            let identity = dictionary
+                .get(entry as usize)
+                .map(String::as_str)
+                .unwrap_or("minecraft:plains");
+            let name = identity.split('[').next().unwrap_or(identity);
+            u32::from(ctx.biomes.id(name))
+        }
+    }
+}
+
+/// LSS identity → block state (unknown properties skipped; unknown blocks → stone).
+pub fn resolve_block_identity(
+    registry: &BlockRegistry,
+    identity: &str,
+) -> Result<BlockStateId, String> {
+    let (name, props) = match identity.split_once('[') {
+        Some((n, rest)) => (n, rest.trim_end_matches(']')),
+        None => (identity, ""),
+    };
+    let name = if name.contains(':') {
+        name.to_owned()
+    } else {
+        format!("minecraft:{name}")
+    };
+    let default = registry
+        .default_state(&name)
+        .ok_or_else(|| format!("unknown block {name}"))?;
+    let mut state = registry
+        .state(default)
+        .ok_or("missing default state")?
+        .clone();
+    for pair in props.split(',').filter(|p| !p.is_empty()) {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if state.properties.contains_key(k) {
+            state.properties.insert(k.to_owned(), v.to_owned());
+        }
+    }
+    registry.resolve(&state).map_err(|e| e.to_string())
 }
 
 /// Inject a decoded LSS column into the far-terrain lod.
-pub fn ingest_frame(lod: &mut Lod, frame: &VoxelColumnFrame) -> Result<(), String> {
-    let columns = sections_to_lod_columns(&frame.section_bytes, frame.codec)?;
+pub fn ingest_frame(
+    lod: &mut Lod,
+    frame: &VoxelColumnFrame,
+    ctx: &LssIngestContext<'_>,
+) -> Result<(), String> {
+    let columns = sections_to_lod_columns(&frame.section_bytes, frame.codec, ctx)?;
     lod.inject_chunk_columns((frame.chunk_x, frame.chunk_z), Arc::new(columns));
     let _ = lod::encode_lod_columns_blob; // keep encode linked for tests / future
     Ok(())
@@ -248,5 +442,16 @@ mod tests {
         let mut r = Reader::new(&pkgs[0].1);
         assert_eq!(r.varint().unwrap(), PROTOCOL_VERSION);
         assert!(r.varint().unwrap() & CAP_VOXEL_COLUMNS != 0);
+    }
+
+    #[test]
+    fn native_corpus_parses_when_present() {
+        let path = std::path::Path::new("/tmp/tmp.8eLtLyYaw1/lss/fabric/src/test/resources/nbt-corpus/multi-section.bin");
+        if !path.exists() {
+            return;
+        }
+        let body = std::fs::read(path).expect("corpus");
+        let column = wire_section::parse(&body, wire_section::Layout::Native).expect("parse");
+        assert!(!column.sections.is_empty());
     }
 }
