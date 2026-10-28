@@ -817,6 +817,21 @@ impl Game<'_> {
                     }
                     continue;
                 }
+                Output::IngestFarColumn {
+                    chunk_x,
+                    chunk_z,
+                    blob,
+                } => {
+                    match horizon_client::lod::decode_lod_columns_blob(&blob) {
+                        Ok(columns) => {
+                            if let Some(lod) = &mut self.lod {
+                                lod.inject_chunk_columns((chunk_x, chunk_z), columns);
+                            }
+                        }
+                        Err(e) => log::warn!("mod LOD ingest refused: {e}"),
+                    }
+                    continue;
+                }
             };
             self.add_mod_chat_line(line);
         }

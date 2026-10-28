@@ -263,32 +263,145 @@ pub fn encode_lod_columns_blob(columns: &[Column; 256]) -> Vec<u8> {
     let mut out = Vec::with_capacity(256 * 32);
     out.push(LOD_COLUMNS_BLOB_VERSION);
     for column in columns {
-        if let Some(s) = &column.surface {
+        encode_column(&mut out, column);
+    }
+    out
+}
+
+fn encode_column(out: &mut Vec<u8>, column: &Column) {
+    if let Some(s) = &column.surface {
+        out.push(1);
+        out.extend_from_slice(&s.height.to_le_bytes());
+        out.extend_from_slice(&s.state.0.to_le_bytes());
+        if let Some((height, state)) = s.water {
             out.push(1);
-            out.extend_from_slice(&s.height.to_le_bytes());
-            out.extend_from_slice(&s.state.0.to_le_bytes());
-            if let Some((height, state)) = s.water {
-                out.push(1);
-                out.extend_from_slice(&height.to_le_bytes());
-                out.extend_from_slice(&state.0.to_le_bytes());
-            } else {
-                out.push(0);
-            }
-            out.extend_from_slice(&s.biome.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&state.0.to_le_bytes());
         } else {
             out.push(0);
         }
-        let count = u16::try_from(column.spans.len()).unwrap_or(u16::MAX);
-        out.extend_from_slice(&count.to_le_bytes());
-        for span in column.spans.iter().take(usize::from(count)) {
-            out.extend_from_slice(&span.min.to_le_bytes());
-            out.extend_from_slice(&span.max.to_le_bytes());
-            out.extend_from_slice(&span.state.0.to_le_bytes());
-            out.extend_from_slice(&span.biome.to_le_bytes());
-            out.extend_from_slice(&span.light.to_le_bytes());
-        }
+        out.extend_from_slice(&s.biome.to_le_bytes());
+    } else {
+        out.push(0);
     }
-    out
+    let count = u16::try_from(column.spans.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for span in column.spans.iter().take(usize::from(count)) {
+        out.extend_from_slice(&span.min.to_le_bytes());
+        out.extend_from_slice(&span.max.to_le_bytes());
+        out.extend_from_slice(&span.state.0.to_le_bytes());
+        out.extend_from_slice(&span.biome.to_le_bytes());
+        out.extend_from_slice(&span.light.to_le_bytes());
+    }
+}
+
+/// Decodes [`encode_lod_columns_blob`] output (version 1, little-endian).
+pub fn decode_lod_columns_blob(blob: &[u8]) -> Result<Arc<[Column; 256]>, String> {
+    let mut pos = 0;
+    let version = take_u8(blob, &mut pos)?;
+    if version != LOD_COLUMNS_BLOB_VERSION {
+        return Err(format!(
+            "lod columns blob version {version}, expected {}",
+            LOD_COLUMNS_BLOB_VERSION
+        ));
+    }
+    let mut columns = std::array::from_fn(|_| Column::default());
+    for column in &mut columns {
+        *column = decode_column(blob, &mut pos)?;
+    }
+    if pos != blob.len() {
+        return Err(format!(
+            "lod columns blob: {} trailing byte(s) after column data",
+            blob.len() - pos
+        ));
+    }
+    Ok(Arc::new(columns))
+}
+
+fn take_u8(blob: &[u8], pos: &mut usize) -> Result<u8, String> {
+    blob.get(*pos)
+        .copied()
+        .ok_or_else(|| "lod columns blob: unexpected end".into())
+        .map(|b| {
+            *pos += 1;
+            b
+        })
+}
+
+fn take_slice<const N: usize>(blob: &[u8], pos: &mut usize) -> Result<[u8; N], String> {
+    let end = pos
+        .checked_add(N)
+        .ok_or_else(|| "lod columns blob: unexpected end".to_string())?;
+    let slice = blob
+        .get(*pos..end)
+        .ok_or_else(|| "lod columns blob: unexpected end".to_string())?;
+    *pos = end;
+    slice.try_into().map_err(|_| "lod columns blob: bad slice".into())
+}
+
+fn decode_column(blob: &[u8], pos: &mut usize) -> Result<Column, String> {
+    let mut column = Column::default();
+    match take_u8(blob, pos)? {
+        0 => {}
+        1 => {
+            let height = i32::from_le_bytes(take_slice(blob, pos)?);
+            let state = BlockStateId(u32::from_le_bytes(take_slice(blob, pos)?));
+            let water = match take_u8(blob, pos)? {
+                0 => None,
+                1 => Some((
+                    i32::from_le_bytes(take_slice(blob, pos)?),
+                    BlockStateId(u32::from_le_bytes(take_slice(blob, pos)?)),
+                )),
+                flag => return Err(format!("lod columns blob: bad water flag {flag}")),
+            };
+            let biome = u16::from_le_bytes(take_slice(blob, pos)?);
+            column.surface = Some(Surface {
+                height,
+                state,
+                water,
+                biome,
+            });
+        }
+        flag => return Err(format!("lod columns blob: bad surface flag {flag}")),
+    }
+    let count = u16::from_le_bytes(take_slice(blob, pos)?);
+    column.spans.reserve(usize::from(count));
+    for _ in 0..count {
+        column.spans.push(Span {
+            min: i16::from_le_bytes(take_slice(blob, pos)?),
+            max: i16::from_le_bytes(take_slice(blob, pos)?),
+            state: BlockStateId(u32::from_le_bytes(take_slice(blob, pos)?)),
+            biome: u16::from_le_bytes(take_slice(blob, pos)?),
+            light: u16::from_le_bytes(take_slice(blob, pos)?),
+        });
+    }
+    Ok(column)
+}
+
+#[cfg(test)]
+mod blob_roundtrip {
+    use super::*;
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let mut columns = std::array::from_fn(|_| Column::default());
+        columns[0].surface = Some(Surface {
+            height: 64,
+            state: BlockStateId(1),
+            water: None,
+            biome: 3,
+        });
+        columns[0].spans.push(Span {
+            min: 0,
+            max: 64,
+            state: BlockStateId(1),
+            biome: 3,
+            light: 0,
+        });
+        let blob = encode_lod_columns_blob(&columns);
+        let back = decode_lod_columns_blob(&blob).expect("decode");
+        assert_eq!(*back, columns);
+    }
 }
 /// `state_kinds` bits: kept in columns, a fluid, the air state; the light
 /// emission is in the high nibble.

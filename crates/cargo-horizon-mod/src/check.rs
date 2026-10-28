@@ -284,6 +284,10 @@ fn play(path: &Path, report: &mut Report) -> Result<(), String> {
             Output::Shake { strength, seconds } => {
                 format!("shook the camera: {strength:.2} for {seconds:.1} s")
             }
+            Output::NetToServer { .. } | Output::NetToClient { .. } => "net payload".to_string(),
+            Output::IngestFarColumn { chunk_x, chunk_z, .. } => {
+                format!("ingest far column {chunk_x} {chunk_z}")
+            }
         });
     }
     let shapes = mods.hud_shapes().count();

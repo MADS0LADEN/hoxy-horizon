@@ -127,6 +127,11 @@ interface command {
 interface net {
     /// Serverbound on the client; delivered to this mod id's server instance.
     send: func(payload: list<u8>) -> result<_, string>;
+    /// Server mods only: to this mod's client half for `player` (an id from
+    /// `players.online`). On the client, and in player-scoped server hooks,
+    /// [`send`] already targets that player. During `server-events.tick`,
+    /// [`send`] has no player; use this instead.
+    send-to: func(player: string, payload: list<u8>) -> result<_, string>;
     /// Payloads from the peer half since the last hook (oldest first).
     poll: func() -> list<list<u8>>;
 }
@@ -439,6 +444,12 @@ interface render {
     /// Distance setting, when on, wins. One far terrain shows at a time: the
     /// first loaded mod's.
     set-far-terrain: func(far-terrain: option<far-terrain>);
+    /// Injects far-terrain columns for chunk (`chunk-x`, `chunk-z`). `blob` is
+    /// the version 1 little-endian format from the host's LOD column encoder
+    /// (same bytes as `world.get-lod-columns`). `dimension` is reserved for
+    /// per-dimension Lod later; v1 uses the player's active dimension only and
+    /// ignores this string.
+    ingest-far-column: func(dimension: string, chunk-x: s32, chunk-z: s32, blob: list<u8>) -> result<_, string>;
 }
 
 /// What the game calls. Only the hooks `init` asks for are ever called.

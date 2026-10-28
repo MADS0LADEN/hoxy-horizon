@@ -266,6 +266,12 @@ pub enum Output {
         count: u32,
         components: String,
     },
+    /// `render.ingest-far-column`: streamed far-terrain columns for one chunk.
+    IngestFarColumn {
+        chunk_x: i32,
+        chunk_z: i32,
+        blob: Vec<u8>,
+    },
 }
 
 /// The game's world as capability `world` reads it during a call: the
@@ -1930,6 +1936,24 @@ impl render::Host for State {
             ..f
         });
     }
+    fn ingest_far_column(
+        &mut self,
+        _dimension: String,
+        chunk_x: i32,
+        chunk_z: i32,
+        blob: Vec<u8>,
+    ) -> Result<(), String> {
+        const MAX: usize = 8 << 20;
+        if blob.len() > MAX {
+            return Err(format!("render.ingest-far-column: over {MAX} bytes"));
+        }
+        self.out.push(Output::IngestFarColumn {
+            chunk_x,
+            chunk_z,
+            blob,
+        });
+        Ok(())
+    }
     fn frame_stats(&mut self) -> FrameRate {
         let (fps, min, low) = self.snapshot.frame;
         FrameRate { fps, min, low }
@@ -1959,7 +1983,7 @@ impl net::Host for State {
         }
         if self.server_mod {
             let Some(player) = self.net_player.clone() else {
-                return Err("net.send: no player in this server hook".into());
+                return Err("net.send: no player in this server hook (use net.send-to from server tick)".into());
             };
             self.out.push(Output::NetToClient {
                 mod_id: self.id.clone(),
@@ -1973,6 +1997,23 @@ impl net::Host for State {
                 payload,
             });
         }
+        Ok(())
+    }
+    fn send_to(&mut self, player: String, payload: Vec<u8>) -> Result<(), String> {
+        if !self.server_mod {
+            return Err("net.send-to: server mods only".into());
+        }
+        if payload.len() > NET_MAX_SEND {
+            return Err(format!("net.send-to: over {NET_MAX_SEND} bytes"));
+        }
+        if !self.snapshot.players.iter().any(|p| p.id == player) {
+            return Err("net.send-to: no such player".into());
+        }
+        self.out.push(Output::NetToClient {
+            mod_id: self.id.clone(),
+            player,
+            payload,
+        });
         Ok(())
     }
     fn poll(&mut self) -> Vec<Vec<u8>> {
