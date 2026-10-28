@@ -122,6 +122,12 @@ impl Levels {
             .iter_mut()
             .map(|(d, p)| (*d, &mut p.world.chunks))
     }
+    /// Each parked level's save directory (capability `world` LOD reads).
+    pub(super) fn parked_saves(&self) -> impl Iterator<Item = (&'static str, Arc<SaveDir>)> + '_ {
+        self.parked
+            .iter()
+            .map(|(d, p)| (d.id(), p.save.clone()))
+    }
     /// The levels that are not in place, by dimension.
     pub(super) fn parked_dims(&self) -> Vec<Dim> {
         self.parked.keys().copied().collect()

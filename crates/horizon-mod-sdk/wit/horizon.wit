@@ -699,6 +699,10 @@ interface %world {
     /// in order after this call returns, before that dimension's next tick;
     /// one in a chunk not loaded then is skipped. At most 4096 per call.
     set-blocks: func(dimension: string, blocks: list<block-change>) -> result<_, string>;
+    /// The 256 far-terrain columns for one chunk, as an opaque host blob (see
+    /// `horizon_client::lod::encode_lod_columns_blob`). None when the chunk is
+    /// neither loaded nor on disk; does not load into simulation.
+    get-lod-columns: func(dimension: string, chunk-x: s32, chunk-z: s32) -> option<list<u8>>;
 }
 
 /// What the server calls in a server mod (manifest `api = "0.3"`,

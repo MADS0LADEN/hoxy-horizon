@@ -280,6 +280,11 @@ pub trait WorldView: std::any::Any + Send {
     fn has_dimension(&self, dimension: &str) -> bool;
     /// `Err` (why) for a state string that names no block state.
     fn check_state(&self, state: &str) -> Result<(), String>;
+    /// The 256 LOD columns for chunk `(chunk_x, chunk_z)` in `dimension`, as a
+    /// versioned opaque blob for WASM (`horizon_client::lod::encode_lod_columns_blob`).
+    /// `None` when the chunk is neither loaded nor readable from the save (v1 does
+    /// not force-load into simulation).
+    fn lod_columns(&self, dimension: &str, chunk_x: i32, chunk_z: i32) -> Option<Vec<u8>>;
 }
 
 /// The view lent for the current calls, shared by every mod's store.
@@ -1676,6 +1681,15 @@ impl mod_world::Host for State {
             });
         }
         Ok(())
+    }
+    fn get_lod_columns(
+        &mut self,
+        dimension: String,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Option<Vec<u8>> {
+        let view = self.world.lock().ok()?;
+        view.as_ref()?.lod_columns(&dimension, chunk_x, chunk_z)
     }
 }
 impl players::Host for State {

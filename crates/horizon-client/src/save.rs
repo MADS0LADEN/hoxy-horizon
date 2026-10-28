@@ -3651,8 +3651,20 @@ fn decode_lod_surfaces(
     Some(Arc::from(columns))
 }
 
+/// The 256 LOD columns for `(chunk_x, chunk_z)` from region files, without
+/// loading the chunk into simulation (same data as far-terrain disk reads).
+pub fn lod_columns_from_region(
+    save: &SaveDir,
+    chunk_x: i32,
+    chunk_z: i32,
+    assets: &crate::assets::Assets,
+    biomes: &Biomes,
+) -> Option<LodSurfaces> {
+    save.lod_surfaces(chunk_x, chunk_z, assets, biomes)
+}
+
 impl SaveDir {
-    fn lod_surfaces(
+    pub(crate) fn lod_surfaces(
         &self,
         x: i32,
         z: i32,

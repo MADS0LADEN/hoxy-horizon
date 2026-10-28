@@ -57,6 +57,8 @@ mod run {
     use horizon_client::{
         command::args::GameMode as Mode,
         lan::data::component_nbt,
+        lod::{block_state_kinds, encode_lod_columns_blob, lod_columns_from_chunk_kinds},
+        save::{SaveDir, lod_columns_from_region},
         text::{self, Text},
     };
     use horizon_mods::{
@@ -74,8 +76,43 @@ mod run {
     /// of the game for the call and back after it (no copy).
     struct LentWorld {
         registry: &'static BlockRegistry,
+        kinds: Vec<u8>,
+        assets: std::sync::Arc<horizon_client::assets::Assets>,
         biomes: std::sync::Arc<horizon_client::biome::Biomes>,
+        active_dim: &'static str,
+        active_save: std::sync::Arc<SaveDir>,
+        parked_saves: Vec<(&'static str, std::sync::Arc<SaveDir>)>,
+        world_root: std::path::PathBuf,
         dims: Vec<(&'static str, ChunkMap)>,
+    }
+    impl LentWorld {
+        fn save_for(&self, dimension: &str) -> Option<std::sync::Arc<SaveDir>> {
+            if dimension == self.active_dim {
+                return Some(self.active_save.clone());
+            }
+            if let Some((_, save)) = self.parked_saves.iter().find(|(d, _)| *d == dimension) {
+                return Some(save.clone());
+            }
+            let dir = horizon_client::save::dimension_dir(&self.world_root, dimension);
+            dir.is_dir().then(|| std::sync::Arc::new(SaveDir::new(dir)))
+        }
+        fn lod_columns_raw(
+            &self,
+            dimension: &str,
+            chunk_x: i32,
+            chunk_z: i32,
+        ) -> Option<std::sync::Arc<[horizon_client::lod::Column; 256]>> {
+            if !self.has_dimension(dimension) {
+                return None;
+            }
+            if let Some((_, chunks)) = self.dims.iter().find(|(d, _)| *d == dimension)
+                && let Some(chunk) = chunks.get(&(chunk_x, chunk_z))
+            {
+                return Some(lod_columns_from_chunk_kinds(chunk, &self.kinds));
+            }
+            let save = self.save_for(dimension)?;
+            lod_columns_from_region(&save, chunk_x, chunk_z, &self.assets, self.biomes.as_ref())
+        }
     }
     impl WorldView for LentWorld {
         fn block(&self, dimension: &str, x: i32, y: i32, z: i32) -> Option<String> {
@@ -98,6 +135,10 @@ mod run {
             crate::game::render_control::parse_state(self.registry, state)
                 .map(drop)
                 .map_err(|e| format!("{state}: {e}"))
+        }
+        fn lod_columns(&self, dimension: &str, chunk_x: i32, chunk_z: i32) -> Option<Vec<u8>> {
+            let columns = self.lod_columns_raw(dimension, chunk_x, chunk_z)?;
+            Some(encode_lod_columns_blob(columns.as_ref()))
         }
     }
 
@@ -340,10 +381,22 @@ mod run {
                 dims.push((dim.id(), std::mem::take(chunks)));
             }
             let registry = self.pack.assets.registry;
+            let kinds = block_state_kinds(self.res.facts());
+            let assets = self.pack.assets.clone();
             let biomes = self.res.biomes().clone();
+            let active_dim = self.dim.id();
+            let active_save = self.save.clone();
+            let parked_saves: Vec<_> = self.levels.parked_saves().collect();
+            let world_root = self.world_root.clone();
             self.mods.mods.lend_world(Box::new(LentWorld {
                 registry,
+                kinds,
+                assets,
                 biomes,
+                active_dim,
+                active_save,
+                parked_saves,
+                world_root,
                 dims,
             }));
         }

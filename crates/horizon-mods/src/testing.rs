@@ -77,6 +77,9 @@ impl crate::WorldView for ScriptWorld {
             .then_some(())
             .ok_or_else(|| format!("{state} is not a block state"))
     }
+    fn lod_columns(&self, _dimension: &str, _chunk_x: i32, _chunk_z: i32) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Where a script starts: standing at 0.5 64 0.5 in the Overworld, facing

@@ -237,6 +237,59 @@ fn summarize(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
         Column::from_chunk(chunk, kinds, (i & 15) as i32, (i >> 4) as i32)
     }))
 }
+/// LOD columns for a resident gameplay chunk (same reduction as `Lod::observe`).
+pub fn lod_columns_from_chunk(chunk: &Chunk, facts: &BlockFacts) -> Arc<[Column; 256]> {
+    summarize(chunk, &state_kinds(facts))
+}
+
+/// Per-block-state tags for [`lod_columns_from_chunk`], cached for repeated reads.
+pub fn block_state_kinds(facts: &BlockFacts) -> Vec<u8> {
+    state_kinds(facts)
+}
+
+pub fn lod_columns_from_chunk_kinds(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
+    summarize(chunk, kinds)
+}
+
+/// Version 1 blob (little-endian) for one chunk's 256 columns, for WASM and
+/// `net` payloads: `u8` version (`LOD_COLUMNS_BLOB_VERSION`), then column index
+/// order `x + 16*z` for `x,z` in `0..16`. Each column: `u8` surface flag;
+/// if set: `i32` height, `u32` block state, `u8` water flag, optional `i32`
+/// water height + `u32` water state, `u16` biome; then `u16` span count and
+/// spans of `i16` min, `i16` max, `u32` state, `u16` biome, `u16` light.
+pub const LOD_COLUMNS_BLOB_VERSION: u8 = 1;
+
+pub fn encode_lod_columns_blob(columns: &[Column; 256]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256 * 32);
+    out.push(LOD_COLUMNS_BLOB_VERSION);
+    for column in columns {
+        if let Some(s) = &column.surface {
+            out.push(1);
+            out.extend_from_slice(&s.height.to_le_bytes());
+            out.extend_from_slice(&s.state.0.to_le_bytes());
+            if let Some((height, state)) = s.water {
+                out.push(1);
+                out.extend_from_slice(&height.to_le_bytes());
+                out.extend_from_slice(&state.0.to_le_bytes());
+            } else {
+                out.push(0);
+            }
+            out.extend_from_slice(&s.biome.to_le_bytes());
+        } else {
+            out.push(0);
+        }
+        let count = u16::try_from(column.spans.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for span in column.spans.iter().take(usize::from(count)) {
+            out.extend_from_slice(&span.min.to_le_bytes());
+            out.extend_from_slice(&span.max.to_le_bytes());
+            out.extend_from_slice(&span.state.0.to_le_bytes());
+            out.extend_from_slice(&span.biome.to_le_bytes());
+            out.extend_from_slice(&span.light.to_le_bytes());
+        }
+    }
+    out
+}
 /// `state_kinds` bits: kept in columns, a fluid, the air state; the light
 /// emission is in the high nibble.
 const KEPT: u8 = 1;
