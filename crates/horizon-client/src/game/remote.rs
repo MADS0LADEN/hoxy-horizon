@@ -111,6 +111,8 @@ pub(super) struct Remote {
     pub brand: String,
     /// The server announced it runs mods' quiet commands.
     pub quiet_commands: bool,
+    /// Native LSS client (Voxy-server-side / LOD Server Support on Java).
+    pub lss: horizon_client::lss::LssClient,
     pub(super) builtin: Arc<Builtin>,
     lang: Arc<Language>,
     pub(super) registries: Arc<Dynamic>,
@@ -449,6 +451,10 @@ impl Game<'_> {
             session,
             brand: "unknown".into(),
             quiet_commands: false,
+            lss: horizon_client::lss::LssClient {
+                enabled: true,
+                ..Default::default()
+            },
             builtin: Arc::new(builtin),
             lang,
             registries: Arc::new(Dynamic::default()),
@@ -1751,6 +1757,12 @@ impl Game<'_> {
                     horizon_protocol::packets::configuration::ClientInformation::new(view);
                 info.chat_visibility = self.settings.chat_visibility as i32;
                 self.send(S::ClientInformation(info));
+                // Speak LSS to Java LOD Server Support / Voxy-server-side.
+                if let Some(r) = self.remote.as_mut() {
+                    r.lss
+                        .on_joined_world(horizon_world::DATA_VERSION);
+                }
+                self.flush_lss();
             }
             C::Respawn(p) => {
                 // A new player, without effects (the server sends them
@@ -2977,9 +2989,69 @@ impl Game<'_> {
                     self.titles.reset_times();
                 }
             }
+            C::CustomPayload(p) if p.channel.starts_with("lss:") => {
+                self.on_lss_payload(&p.channel, &p.data);
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Handle one LSS custom payload; inject columns when decode succeeds.
+    fn on_lss_payload(&mut self, channel: &str, data: &[u8]) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        match remote.lss.on_payload(channel, data) {
+            Ok(Some(frame)) => {
+                remote.lss.received += 1;
+                if let Some(lod) = self.lod.as_mut() {
+                    if let Err(e) = horizon_client::lss::ingest_frame(lod, &frame) {
+                        log::debug!("lss ingest: {e}");
+                    }
+                } else {
+                    // Ensure far terrain exists for remote LSS feeds.
+                    self.prepare_lod();
+                    if let Some(lod) = self.lod.as_mut()
+                        && let Err(e) = horizon_client::lss::ingest_frame(lod, &frame)
+                    {
+                        log::debug!("lss ingest: {e}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::debug!("lss payload {channel}: {e}"),
+        }
+        self.flush_lss();
+    }
+
+    /// Send queued LSS custom payloads on the play connection.
+    pub(super) fn flush_lss(&mut self) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        while let Some((channel, data)) = remote.lss.out.pop_front() {
+            self.send(S::CustomPayload(
+                horizon_protocol::packets::configuration::CustomPayload { channel, data },
+            ));
+        }
+    }
+
+    /// Ask LSS for a ring of columns around the player (once per second-ish).
+    pub(super) fn tick_lss_requests(&mut self) {
+        let (pcx, pcz) = match self.player.as_ref() {
+            Some(p) => (
+                (p.position.x.floor() as i32) >> 4,
+                (p.position.z.floor() as i32) >> 4,
+            ),
+            None => return,
+        };
+        if let Some(r) = self.remote.as_mut() {
+            if r.lss.enabled && self.ticks % 40 == 0 {
+                r.lss.request_ring(pcx, pcz);
+            }
+        }
+        self.flush_lss();
     }
     /// `handleAddObjective`: add, remove or change an objective.
     fn remote_objective(&mut self, p: play::SetObjective) {

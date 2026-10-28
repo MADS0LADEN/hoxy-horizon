@@ -97,6 +97,7 @@ pub mod level_loading;
 pub mod light;
 pub mod locator_bar;
 pub mod lod;
+pub mod lss;
 pub mod logging;
 pub mod menu;
 pub mod menu_blur;

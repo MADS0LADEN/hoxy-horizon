@@ -5084,6 +5084,9 @@ impl Game<'_> {
         self.tick_command_extras();
         self.tick_mods();
         self.tick_server_mods();
+        if self.remote.is_some() {
+            self.tick_lss_requests();
+        }
         let camera_eye = self.camera_eye_height();
         let stick = self.pad_move();
         if self.riding.is_some() && self.player.is_some() {
@@ -12311,10 +12314,21 @@ impl Game<'_> {
         if g.lod_distance > 0 {
             return (g.lod_distance, reduced);
         }
-        match self.mod_far_terrain() {
-            Some(f) => (f.distance, reduced || f.reduced),
-            None => (0, reduced),
+        if let Some(f) = self.mod_far_terrain() {
+            return (f.distance, reduced || f.reduced);
         }
+        // LSS / Voxy-server-side feed: enable far terrain at a default radius.
+        if self.remote.as_ref().is_some_and(|r| r.lss.enabled) {
+            let d = self
+                .remote
+                .as_ref()
+                .and_then(|r| r.lss.session.as_ref())
+                .map(|s| s.lod_distance_chunks as u32)
+                .unwrap_or(256)
+                .clamp(64, 1024);
+            return (d, reduced);
+        }
+        (0, reduced)
     }
     /// LOD Distance as far terrain uses it (`graphics::lod_distance_capped`).
     fn lod_distance(&self) -> u32 {
@@ -12357,13 +12371,15 @@ impl Game<'_> {
         }
     }
     fn prepare_lod(&mut self) {
+        let lss = self.remote.as_ref().is_some_and(|r| r.lss.enabled);
         let enabled = self.far_terrain_choice().0 > 0
             && self.renderer.is_some()
             && self.player.is_some()
             && self.title.is_none()
             && (self.remote.is_none()
                 || self.integrated.is_some()
-                || self.mods_remote_lod_enabled());
+                || self.mods_remote_lod_enabled()
+                || lss);
         if !enabled {
             if self.lod.is_some() || self.lod_source_attempted {
                 self.clear_lod();
