@@ -537,6 +537,77 @@ impl Game<'_> {
         }
         None
     }
+    /// A guest's `horizon:mod_net` payload: into the matching server mod's
+    /// `net.poll` queue (player context is already the guest when they tick).
+    pub(super) fn guest_mod_net(&mut self, _host: &mut LanHost, _conn: u32, data: &[u8]) {
+        match horizon_protocol::mod_net::decode(data) {
+            Ok(frame) => self.mods.mods.enqueue_net(&frame.mod_id, true, frame.payload),
+            Err(e) => super::dedicated::log("WARN", &format!("mod_net refused: {e}")),
+        }
+    }
+    /// Client `net.send`: local loopback into the server half, or a
+    /// `horizon:mod_net` payload on a remote play connection.
+    fn mod_net_to_server(&mut self, mod_id: String, payload: Vec<u8>) {
+        if self.remote.is_some() {
+            let data = horizon_protocol::mod_net::encode(&mod_id, &payload);
+            self.send(horizon_protocol::packets::play::Serverbound::CustomPayload(
+                horizon_protocol::packets::configuration::CustomPayload {
+                    channel: horizon_protocol::mod_net::CHANNEL.into(),
+                    data,
+                },
+            ));
+        } else {
+            self.mods.mods.enqueue_net(&mod_id, true, payload);
+        }
+    }
+    /// Server `net.send`: local loopback into the client half, or a
+    /// `horizon:mod_net` payload to one LAN guest (player id = uuid string).
+    fn mod_net_to_client(
+        &mut self,
+        host: Option<&mut LanHost>,
+        mod_id: String,
+        player: String,
+        payload: Vec<u8>,
+    ) {
+        let local = self.options.execution_role.is_client()
+            && self.remote.is_none()
+            && self.player.is_some()
+            && self.player_uuid_string() == player;
+        if local || host.is_none() {
+            self.mods.mods.enqueue_net(&mod_id, false, payload);
+            return;
+        }
+        let Some(host) = host else {
+            return;
+        };
+        let data = horizon_protocol::mod_net::encode(&mod_id, &payload);
+        let packet = horizon_protocol::packets::play::Clientbound::CustomPayload(
+            horizon_protocol::packets::configuration::CustomPayload {
+                channel: horizon_protocol::mod_net::CHANNEL.into(),
+                data,
+            },
+        );
+        let uuid_string = |u: u128| {
+            let h = format!("{u:032x}");
+            format!(
+                "{}-{}-{}-{}-{}",
+                &h[..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..]
+            )
+        };
+        if let Some(conn) = host
+            .hub
+            .guests
+            .iter()
+            .find(|g| g.placed && uuid_string(g.uuid) == player)
+            .map(|g| g.conn)
+        {
+            host.hub.send_to(conn, &packet);
+        }
+    }
     /// A mod's `command.run-quiet` lines (vanilla's commands only, as
     /// `command.run`): to a server that runs them quietly as one payload
     /// (`horizon_protocol::quiet`), to any other as chat commands, or for this
@@ -688,6 +759,18 @@ impl Game<'_> {
                 }
                 Output::QuietCommands { mod_id, lines } => {
                     self.mod_quiet_commands(mod_id, lines);
+                    continue;
+                }
+                Output::NetToServer { mod_id, payload, .. } => {
+                    self.mod_net_to_server(mod_id, payload);
+                    continue;
+                }
+                Output::NetToClient {
+                    mod_id,
+                    player,
+                    payload,
+                } => {
+                    self.mod_net_to_client(host.as_deref_mut(), mod_id, player, payload);
                     continue;
                 }
                 Output::Stopped { name, reason } => {

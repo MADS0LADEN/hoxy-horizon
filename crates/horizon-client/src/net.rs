@@ -42,6 +42,8 @@ pub enum Event {
     Brand(String),
     /// The server runs mods' quiet commands (`horizon_protocol::quiet`).
     QuietCommands,
+    /// A `horizon:mod_net` custom payload for a client mod's `net.poll`.
+    ModNet(Vec<u8>),
     /// Configuration finished: the play state begins with these registries.
     Joined {
         registries: Arc<Dynamic>,
@@ -583,6 +585,11 @@ fn receive_play(
             play::Clientbound::Disconnect(d) => return Ok(plain(&d.reason, lang)),
             play::Clientbound::CustomPayload(p) if p.channel == "minecraft:brand" => {
                 receive_brand(&p, send);
+            }
+            play::Clientbound::CustomPayload(p)
+                if p.channel == horizon_protocol::mod_net::CHANNEL =>
+            {
+                let _ = send.send(Event::ModNet(p.data));
             }
             other => {
                 if send.send(Event::Packet(Box::new(other))).is_err() {

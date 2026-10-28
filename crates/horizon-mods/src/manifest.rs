@@ -103,9 +103,12 @@ pub enum Capability {
     /// The recipes and items the game knows, for recipe viewers
     /// (interface `recipes`).
     Recipes,
+    /// Binary payloads between this mod's client and server halves
+    /// (interface `net`).
+    Net,
 }
 impl Capability {
-    pub const ALL: [Capability; 12] = [
+    pub const ALL: [Capability; 13] = [
         Capability::GameRead,
         Capability::Chat,
         Capability::Hud,
@@ -118,12 +121,13 @@ impl Capability {
         Capability::Players,
         Capability::World,
         Capability::Recipes,
+        Capability::Net,
     ];
     /// Whether a server mod may have it: the others act on a local player.
     pub fn on_server(self) -> bool {
         matches!(
             self,
-            Capability::Storage | Capability::Players | Capability::World
+            Capability::Storage | Capability::Players | Capability::World | Capability::Net
         )
     }
     /// The WIT interface it grants, in `horizon:mods`.
@@ -141,6 +145,7 @@ impl Capability {
             Capability::Players => "players",
             Capability::World => "world",
             Capability::Recipes => "recipes",
+            Capability::Net => "net",
         }
     }
     /// May change in any release: a mod uses it only with
@@ -148,7 +153,7 @@ impl Capability {
     pub fn is_experimental(self) -> bool {
         matches!(
             self,
-            Capability::Ui | Capability::Render | Capability::Input | Capability::Recipes
+            Capability::Ui | Capability::Render | Capability::Input | Capability::Recipes | Capability::Net
         )
     }
     /// What the player reads before turning the mod on: "May <this>".
@@ -170,6 +175,7 @@ impl Capability {
             Capability::Recipes => {
                 "read the game's recipes and items and which recipes you know, place recipes in your crafting grid and, in creative mode, give you items"
             }
+            Capability::Net => "send and receive data with its server half over the network",
         }
     }
     /// The capability a component import needs, `Ok(None)` for one every
@@ -211,6 +217,7 @@ impl fmt::Display for Capability {
             Capability::Players => "players",
             Capability::World => "world",
             Capability::Recipes => "recipes",
+            Capability::Net => "net",
         };
         f.write_str(name)
     }
@@ -250,7 +257,7 @@ impl Manifest {
         if let Some(c) = m
             .capabilities
             .iter()
-            .find(|c| c.on_server() != server && **c != Capability::Storage)
+            .find(|c| c.on_server() != server && **c != Capability::Storage && **c != Capability::Net)
         {
             let side = if server { "client" } else { "server" };
             return Err(format!("{MANIFEST}: capability {c} is for {side} mods"));

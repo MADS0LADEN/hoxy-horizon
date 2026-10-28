@@ -885,6 +885,10 @@ impl Game<'_> {
                         remote.quiet_commands = true;
                     }
                 }
+                Event::ModNet(data) => match horizon_protocol::mod_net::decode(&data) {
+                    Ok(frame) => self.mods.mods.enqueue_net(&frame.mod_id, false, frame.payload),
+                    Err(e) => log::warn!("mod_net refused: {e}"),
+                },
                 Event::Reconfigured(registries) => {
                     self.boss_overlay.reset();
                     self.set_registries(registries);

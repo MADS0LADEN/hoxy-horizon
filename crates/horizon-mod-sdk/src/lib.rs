@@ -40,7 +40,7 @@ wit_bindgen::generate!({
 pub use exports::horizon::mods::events::{Guest as __Guest, Registration};
 pub use exports::horizon::mods::ui_events::Guest as __UiEventsGuest;
 pub use horizon::mods::{
-    browser, chat, command, game, hud, input, log, recipes, render, storage, ui,
+    browser, chat, command, game, hud, input, log, net, recipes, render, storage, ui,
 };
 
 /// The game's calls into a mod. Only the hooks [`Registration`] asks for
@@ -191,6 +191,7 @@ pub mod server {
         with: {
             "horizon:mods/log@0.1.0": crate::log,
             "horizon:mods/storage@0.1.0": crate::storage,
+            "horizon:mods/net@0.1.0": crate::net,
         },
     });
 
@@ -198,6 +199,8 @@ pub mod server {
         Argument, ArgumentKind, ArgumentValue, BlockPos, Guest as __Guest, Registration,
         ServerCommand,
     };
+    /// Same `net` bindings as the client half (`crate::net`).
+    pub use crate::net;
     pub use horizon::mods::players::{self, GameMode, Player};
     pub use horizon::mods::world::{self, BlockChange};
 

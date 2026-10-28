@@ -11,6 +11,7 @@ pub mod frame;
 pub mod ids;
 pub mod item;
 pub mod packets;
+pub mod mod_net;
 pub mod quiet;
 pub mod registry;
 mod resolver;

@@ -121,6 +121,16 @@ interface command {
     run-quiet: func(lines: list<string>);
 }
 
+/// Capability `net` (experimental): binary payloads between this mod's client
+/// half and server half over the play connection. Max 16 KiB per `send`; at
+/// most 64 payloads queued inbound per mod.
+interface net {
+    /// Serverbound on the client; delivered to this mod id's server instance.
+    send: func(payload: list<u8>) -> result<_, string>;
+    /// Payloads from the peer half since the last hook (oldest first).
+    poll: func() -> list<list<u8>>;
+}
+
 /// Capability `ui`: widgets the game draws with its own menus' widgets, for
 /// a screen the mod owns and a settings page in Options > Mods. Layout and
 /// drawing are the game's: a mod says what its widgets hold, never where
@@ -791,6 +801,7 @@ world horizon-mod {
     import hud;
     import storage;
     import command;
+    import net;
     export events;
 }
 
@@ -802,6 +813,7 @@ world horizon-server-mod {
     import storage;
     import players;
     import %world;
+    import net;
     export server-events;
 }
 

@@ -30,6 +30,7 @@ mod server_bindings {
         with: {
             "horizon:mods/log": super::bindings::horizon::mods::log,
             "horizon:mods/storage": super::bindings::horizon::mods::storage,
+            "horizon:mods/net": super::bindings::horizon::mods::net,
         },
     });
 }
@@ -49,7 +50,7 @@ pub use bindings::horizon::mods::{
 use bindings::{
     HorizonMod,
     exports::horizon::mods::events::Registration,
-    horizon::mods::{chat, command, game, hud, log as mod_log, storage},
+    horizon::mods::{chat, command, game, hud, log as mod_log, net, storage},
 };
 pub use server_bindings::{
     exports::horizon::mods::server_events::{
@@ -117,6 +118,12 @@ const CHAT_PER_CALL: usize = 8;
 /// `command.run-quiet` lines one call of a mod may queue (a quiet payload's
 /// cap, `horizon_protocol::quiet::MAX_LINES`).
 const QUIET_PER_CALL: usize = 256;
+/// `net.send` bytes per call (16 KiB).
+const NET_MAX_SEND: usize = 16 << 10;
+/// Inbound payloads kept per mod (`net.poll`).
+const NET_MAX_QUEUE: usize = 64;
+/// Largest payload on the wire (`horizon_protocol::mod_net::MAX_PAYLOAD`).
+const NET_MAX_PAYLOAD: usize = 32767;
 /// How far `game.raycast` sees, in blocks.
 pub const RAYCAST_MAX: f32 = 1024.0;
 const HUD_LINES: usize = 16;
@@ -208,6 +215,18 @@ pub enum Output {
     /// `command.run-quiet`: vanilla command lines to run as the player with
     /// nothing in the chat (`horizon_protocol::quiet` on a server).
     QuietCommands { mod_id: String, lines: Vec<String> },
+    /// `net.send` on the client: to this mod's server half.
+    NetToServer {
+        mod_id: String,
+        player: Option<String>,
+        payload: Vec<u8>,
+    },
+    /// `net.send` on the server: to this mod's client half for `player`.
+    NetToClient {
+        mod_id: String,
+        player: String,
+        payload: Vec<u8>,
+    },
     /// The mod was turned off: it trapped, overran or failed to start.
     Stopped { name: String, reason: String },
     /// `players.tell`: a line after the mod's name, to the player with this id.
@@ -427,6 +446,10 @@ struct State {
     storage_budget: u64,
     limits: StoreLimits,
     world: WorldSlot,
+    net_in: std::collections::VecDeque<Vec<u8>>,
+    /// Server mod `net.send` during a player hook targets this player.
+    net_player: Option<String>,
+    server_mod: bool,
 }
 
 /// The installed mods and the engine running them. `Mods::default()` is
@@ -438,6 +461,8 @@ pub struct Mods {
     snapshot: Arc<Snapshot>,
     out: Vec<Output>,
     world: WorldSlot,
+    /// During server player hooks, `net.send` targets this player id.
+    net_player: Option<String>,
     /// Moves on whenever a mod starts or stops: the game resends the server
     /// mods' commands to players when it changes.
     generation: u64,
@@ -548,6 +573,8 @@ impl Mods {
                 .map_err(|e| e.to_string())?;
             RecipesHost::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
                 .map_err(|e| e.to_string())?;
+            net::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+                .map_err(|e| e.to_string())?;
             self.engine = Some((engine, linker));
         }
         Ok(self.engine.as_ref().expect("made above"))
@@ -628,6 +655,9 @@ impl Mods {
                 .instances(16)
                 .build(),
             world,
+            net_in: std::collections::VecDeque::new(),
+            net_player: None,
+            server_mod: server,
         };
         let mut store = Store::new(engine, state);
         store.limiter(|s| &mut s.limits);
@@ -766,6 +796,7 @@ impl Mods {
         let run = entry.run.as_mut()?;
         run.store.data_mut().snapshot = self.snapshot.clone();
         run.store.data_mut().storage_budget = STORAGE_WRITE_BUDGET;
+        run.store.data_mut().net_player = self.net_player.clone();
         let started = Instant::now();
         let result = run.store.set_fuel(fuel).and_then(|()| f(run));
         // An average over about the last 64 calls.
@@ -861,39 +892,49 @@ impl Mods {
     }
     /// `player` joined the server (they are in the snapshot's players).
     pub fn player_joined(&mut self, player: &ServerPlayer) {
+        self.net_player = Some(player.id.clone());
         self.each_server(
             FUEL_EVENT,
             |h| h.joins,
             |m, s| m.call_player_joined(s, player),
         );
+        self.net_player = None;
     }
     /// `player` left the server (they are no longer in the snapshot's players).
     pub fn player_left(&mut self, player: &ServerPlayer) {
+        self.net_player = Some(player.id.clone());
         self.each_server(
             FUEL_EVENT,
             |h| h.joins,
             |m, s| m.call_player_left(s, player),
         );
+        self.net_player = None;
     }
     /// A chat message `player` sent, as plain text.
     pub fn player_chat(&mut self, player: &ServerPlayer, text: &str) {
+        self.net_player = Some(player.id.clone());
         self.each_server(FUEL_EVENT, |h| h.chat, |m, s| m.call_chat(s, player, text));
+        self.net_player = None;
     }
     /// `player` broke `state` at `pos`.
     pub fn block_broken(&mut self, player: &ServerPlayer, pos: BlockPos, state: &str) {
+        self.net_player = Some(player.id.clone());
         self.each_server(
             FUEL_EVENT,
             |h| h.blocks,
             |m, s| m.call_block_broken(s, player, pos, state),
         );
+        self.net_player = None;
     }
     /// `player` placed `state` at `pos`.
     pub fn block_placed(&mut self, player: &ServerPlayer, pos: BlockPos, state: &str) {
+        self.net_player = Some(player.id.clone());
         self.each_server(
             FUEL_EVENT,
             |h| h.blocks,
             |m, s| m.call_block_placed(s, player, pos, state),
         );
+        self.net_player = None;
     }
     /// The commands running server mods own and their arguments, for the
     /// server's command tree.
@@ -911,6 +952,7 @@ impl Mods {
         let Some(i) = self.command_owner(true, name) else {
             return false;
         };
+        self.net_player = Some(player.id.clone());
         let reply = |text, error| Output::Reply {
             player: player.id.clone(),
             text,
@@ -927,6 +969,7 @@ impl Mods {
             Ok(values) => values,
             Err(e) => {
                 self.out.push(reply(e, true));
+                self.net_player = None;
                 return true;
             }
         };
@@ -945,6 +988,7 @@ impl Mods {
             Some(Err(text)) => self.out.push(reply(text, true)),
             Some(Ok(None)) | None => {}
         }
+        self.net_player = None;
         true
     }
     /// The running mods' HUD panels.
@@ -1257,6 +1301,30 @@ impl Mods {
     /// What mods asked to show since the last call.
     pub fn drain(&mut self) -> Vec<Output> {
         std::mem::take(&mut self.out)
+    }
+
+    /// Delivers an inbound payload to a running mod's `net.poll` queue.
+    /// `server`: the server mod instance; false: the client mod instance.
+    pub fn enqueue_net(&mut self, mod_id: &str, server: bool, payload: Vec<u8>) {
+        if payload.len() > NET_MAX_PAYLOAD {
+            return;
+        }
+        for e in &mut self.entries {
+            let Some(run) = e.run.as_mut() else {
+                continue;
+            };
+            if run.hooks.server().is_some() != server {
+                continue;
+            }
+            if e.manifest.as_ref().is_some_and(|m| m.id == mod_id) {
+                let q = &mut run.store.data_mut().net_in;
+                while q.len() >= NET_MAX_QUEUE {
+                    q.pop_front();
+                }
+                q.push_back(payload);
+                break;
+            }
+        }
     }
 
     /// Restarts the mods whose file changed since they loaded (mod
@@ -1850,6 +1918,34 @@ impl render::Host for State {
         if strength > 0.0 && seconds > 0.0 {
             self.out.push(Output::Shake { strength, seconds });
         }
+    }
+}
+
+impl net::Host for State {
+    fn send(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        if payload.len() > NET_MAX_SEND {
+            return Err(format!("net.send: over {NET_MAX_SEND} bytes"));
+        }
+        if self.server_mod {
+            let Some(player) = self.net_player.clone() else {
+                return Err("net.send: no player in this server hook".into());
+            };
+            self.out.push(Output::NetToClient {
+                mod_id: self.id.clone(),
+                player,
+                payload,
+            });
+        } else {
+            self.out.push(Output::NetToServer {
+                mod_id: self.id.clone(),
+                player: None,
+                payload,
+            });
+        }
+        Ok(())
+    }
+    fn poll(&mut self) -> Vec<Vec<u8>> {
+        self.net_in.drain(..).collect()
     }
 }
 
