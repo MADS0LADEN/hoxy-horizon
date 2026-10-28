@@ -12343,12 +12343,27 @@ impl Game<'_> {
             renderer.clear_lods();
         }
     }
+    /// Remote play normally skips LOD; a mod feeding columns or far terrain may
+    /// enable it. Procedural sampling still uses the local `LodSource`; inject
+    /// fills columns the server sends.
+    fn mods_remote_lod_enabled(&self) -> bool {
+        #[cfg(feature = "mods")]
+        {
+            self.mods.mods.remote_lod_enabled()
+        }
+        #[cfg(not(feature = "mods"))]
+        {
+            false
+        }
+    }
     fn prepare_lod(&mut self) {
         let enabled = self.far_terrain_choice().0 > 0
             && self.renderer.is_some()
             && self.player.is_some()
             && self.title.is_none()
-            && (self.remote.is_none() || self.integrated.is_some());
+            && (self.remote.is_none()
+                || self.integrated.is_some()
+                || self.mods_remote_lod_enabled());
         if !enabled {
             if self.lod.is_some() || self.lod_source_attempted {
                 self.clear_lod();

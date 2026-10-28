@@ -1223,6 +1223,23 @@ impl Mods {
             .iter()
             .find_map(|e| e.run.as_ref()?.store.data().far_terrain)
     }
+    /// Whether a running mod may use far terrain on a remote client (injected
+    /// columns and/or `render.set-far-terrain`; gaps still use local sampling).
+    pub fn remote_lod_enabled(&self) -> bool {
+        use crate::Capability;
+        self.entries.iter().any(|e| {
+            let Some(run) = e.run.as_ref() else {
+                return false;
+            };
+            if run.store.data().far_terrain.is_some() {
+                return true;
+            }
+            e.manifest.as_ref().is_some_and(|m| {
+                m.capabilities.contains(&Capability::Net)
+                    && m.capabilities.contains(&Capability::Render)
+            })
+        })
+    }
     fn inputs(&self) -> impl Iterator<Item = &InputState> {
         self.entries
             .iter()

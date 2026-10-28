@@ -858,6 +858,18 @@ impl Lod {
     pub fn observing(&self) -> usize {
         self.shared.observed.lock().unwrap().len()
     }
+    /// Replace or seed the 256 columns for `chunk`, as if `observe` and
+    /// `finish_observed` ran. Drops any in-flight observation for the column
+    /// so a stale worker result cannot overwrite injected data.
+    pub fn inject_chunk_columns(&mut self, chunk: (i32, i32), columns: Arc<[Column; 256]>) {
+        self.shared.observed.lock().unwrap().remove(&chunk);
+        self.shared
+            .jobs
+            .lock()
+            .unwrap()
+            .retain(|job| !matches!(job, Job::Observe(key) if *key == chunk));
+        self.finish_observed(chunk, ReducedColumns::new(columns));
+    }
     /// Keeps a visited chunk's summary, unless it is unchanged.
     fn finish_observed(&mut self, key: (i32, i32), columns: ReducedColumns) {
         if self
