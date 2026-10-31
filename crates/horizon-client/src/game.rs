@@ -14924,7 +14924,7 @@ impl Game<'_> {
         let g = &self.settings.horizon;
         let reduced = g.far_detail == horizon_client::graphics::FarDetail::Reduced;
         match self.lss_active() {
-            Some(lss) if g.lod_distance == 0 => (lss.distance().max(0) as u32, reduced),
+            Some(lss) if g.lod_distance == 0 => (lss.server_distance().max(0) as u32, reduced),
             _ => (g.lod_distance, reduced),
         }
     }

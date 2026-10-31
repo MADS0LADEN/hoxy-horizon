@@ -5,7 +5,7 @@ use crate::lod::cache::{self, DiskCache};
 use crate::streaming::{LodDetail, LodSampler, LodSource};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -17,20 +17,28 @@ const RECORD_HEADER: usize = 4 + 4 + 8 + 2;
 pub struct Store {
     cache: DiskCache,
     coarse: RwLock<FxHashMap<(i32, i32), (i64, Column)>>,
-    index: Mutex<File>,
+    index: Mutex<Index>,
     dir: PathBuf,
+    key: u64,
+}
+
+/// `index.bin`, opened for appending, and the records it holds.
+struct Index {
+    file: File,
+    records: usize,
 }
 
 impl Store {
     pub fn open(dir: PathBuf, key: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         let index_path = dir.join("index.bin");
-        let (coarse, index_file) = load_index(&dir, &index_path, key)?;
+        let (coarse, index) = load_index(&dir, &index_path, key)?;
         Ok(Self {
             cache: DiskCache::new(dir.clone(), key),
             coarse: RwLock::new(coarse),
-            index: Mutex::new(index_file),
+            index: Mutex::new(index),
             dir,
+            key,
         })
     }
 
@@ -67,13 +75,29 @@ impl Store {
         record.extend_from_slice(&timestamp.to_le_bytes());
         record.extend_from_slice(&(encoded.len() as u16).to_le_bytes());
         record.extend_from_slice(&encoded);
-        let Ok(mut file) = self.index.lock() else {
+        let Ok(mut index) = self.index.lock() else {
             return;
         };
-        if file.write_all(&record).is_ok() {
-            let _ = file.sync_all();
+        if index.file.write_all(&record).is_ok() {
+            index.records += 1;
         }
-        maybe_compact(&self.dir, &mut file, &self.coarse);
+        let live = self.coarse.read().unwrap_or_else(|e| e.into_inner()).len();
+        if index.records > live * 2 + 1024 {
+            let map = self
+                .coarse
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match compact(&self.dir, self.key, &map) {
+                Ok(file) => {
+                    *index = Index {
+                        file,
+                        records: map.len(),
+                    }
+                }
+                Err(error) => log::warn!("LSS index compaction failed: {error}"),
+            }
+        }
     }
 
     pub fn columns(&self, pos: (i32, i32)) -> Option<Arc<[Column; 256]>> {
@@ -191,143 +215,78 @@ fn load_index(
     dir: &Path,
     path: &Path,
     key: u64,
-) -> std::io::Result<(FxHashMap<(i32, i32), (i64, Column)>, File)> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    let size = file.metadata()?.len();
-    if size < INDEX_HEADER as u64 {
-        write_index_header(&mut file, key)?;
-        return Ok((FxHashMap::default(), file));
-    }
-    let mut header = [0u8; INDEX_HEADER];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut header)?;
-    if header[..4] != *INDEX_MAGIC
-        || header[4..8] != INDEX_FORMAT.to_le_bytes()
-        || header[8..] != key.to_le_bytes()
-    {
-        clear_storage(dir, path)?;
-        file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        write_index_header(&mut file, key)?;
-        return Ok((FxHashMap::default(), file));
-    }
+) -> std::io::Result<(FxHashMap<(i32, i32), (i64, Column)>, Index)> {
     let mut map = FxHashMap::default();
-    let mut at = INDEX_HEADER as u64;
-    let mut record_count = 0usize;
-    let mut record = vec![0u8; RECORD_HEADER];
-    while at + RECORD_HEADER as u64 <= size {
-        file.seek(SeekFrom::Start(at))?;
-        if file.read_exact(&mut record).is_err() {
-            break;
-        }
-        record_count += 1;
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let current = bytes.len() >= INDEX_HEADER
+        && bytes[..4] == *INDEX_MAGIC
+        && bytes[4..8] == INDEX_FORMAT.to_le_bytes()
+        && bytes[8..INDEX_HEADER] == key.to_le_bytes();
+    if !current {
+        clear_storage(dir, path)?;
+        let mut file = File::create(path)?;
+        write_index_header(&mut file, key)?;
+        let file = OpenOptions::new().append(true).open(path)?;
+        return Ok((map, Index { file, records: 0 }));
+    }
+    let mut at = INDEX_HEADER;
+    let mut records = 0;
+    while let Some(record) = bytes.get(at..at + RECORD_HEADER) {
         let x = i32::from_le_bytes(record[0..4].try_into().unwrap());
         let z = i32::from_le_bytes(record[4..8].try_into().unwrap());
         let ts = i64::from_le_bytes(record[8..16].try_into().unwrap());
-        let len = u16::from_le_bytes(record[16..18].try_into().unwrap()) as u64;
-        if at + RECORD_HEADER as u64 + len > size {
+        let len = usize::from(u16::from_le_bytes(record[16..18].try_into().unwrap()));
+        let Some(payload) = bytes.get(at + RECORD_HEADER..at + RECORD_HEADER + len) else {
             break;
-        }
-        let mut payload = vec![0u8; len as usize];
-        file.read_exact(&mut payload)?;
+        };
         let mut cursor = 0;
-        if let Some(column) = cache::decode_column(&payload, &mut cursor)
+        if let Some(column) = cache::decode_column(payload, &mut cursor)
             && cursor == payload.len()
         {
             map.insert((x, z), (ts, column));
         }
-        at += RECORD_HEADER as u64 + len;
+        records += 1;
+        at += RECORD_HEADER + len;
     }
-    if at < size {
-        file.set_len(at)?;
+    if records > map.len() * 2 + 1024 {
+        let file = compact(dir, key, &map)?;
+        let records = map.len();
+        return Ok((map, Index { file, records }));
     }
-    let live = map.len();
-    if record_count > live * 2 + 1024 {
-        compact_if_needed(dir, path, key, &mut map, &mut file)?;
+    let file = OpenOptions::new().append(true).open(path)?;
+    if at < bytes.len() {
+        file.set_len(at as u64)?;
     }
-    Ok((map, file))
+    Ok((map, Index { file, records }))
 }
 
-fn compact_if_needed(
+/// Rewrites `index.bin` with one record per chunk; the new file, for appending.
+fn compact(
     dir: &Path,
-    path: &Path,
     key: u64,
-    map: &mut FxHashMap<(i32, i32), (i64, Column)>,
-    file: &mut File,
-) -> std::io::Result<()> {
-    let size = file.metadata()?.len();
-    let record_count = count_index_records(size);
-    let live = map.len();
-    if record_count <= live * 2 + 1024 {
-        return Ok(());
-    }
+    map: &FxHashMap<(i32, i32), (i64, Column)>,
+) -> std::io::Result<File> {
+    let path = dir.join("index.bin");
     let tmp = dir.join("index.bin.new");
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
-    write_index_header(&mut out, key)?;
-    for (&(x, z), (ts, column)) in map.iter() {
+    let mut out = Vec::new();
+    out.extend_from_slice(INDEX_MAGIC);
+    out.extend_from_slice(&INDEX_FORMAT.to_le_bytes());
+    out.extend_from_slice(&key.to_le_bytes());
+    for (&(x, z), (ts, column)) in map {
         let mut encoded = Vec::new();
         cache::encode_column(&mut encoded, column);
-        out.write_all(&x.to_le_bytes())?;
-        out.write_all(&z.to_le_bytes())?;
-        out.write_all(&ts.to_le_bytes())?;
-        out.write_all(&(encoded.len() as u16).to_le_bytes())?;
-        out.write_all(&encoded)?;
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&z.to_le_bytes());
+        out.extend_from_slice(&ts.to_le_bytes());
+        out.extend_from_slice(&(encoded.len() as u16).to_le_bytes());
+        out.extend_from_slice(&encoded);
     }
-    out.sync_all()?;
-    drop(out);
-    std::fs::rename(tmp, path)?;
-    *file = OpenOptions::new().read(true).write(true).open(path)?;
-    Ok(())
-}
-
-fn maybe_compact(
-    dir: &Path,
-    file: &mut File,
-    coarse: &RwLock<FxHashMap<(i32, i32), (i64, Column)>>,
-) {
-    let Ok(size) = file.metadata().map(|m| m.len()) else {
-        return;
-    };
-    let live = coarse.read().unwrap_or_else(|e| e.into_inner()).len();
-    let record_count = count_index_records(size);
-    if record_count <= live * 2 + 1024 {
-        return;
-    }
-    let path = dir.join("index.bin");
-    let key = {
-        let mut header = [0u8; INDEX_HEADER];
-        if file.seek(SeekFrom::Start(0)).is_err() || file.read_exact(&mut header).is_err() {
-            return;
-        }
-        u64::from_le_bytes(header[8..].try_into().unwrap())
-    };
-    let mut map = coarse.write().unwrap_or_else(|e| e.into_inner()).clone();
-    let _ = compact_if_needed(dir, &path, key, &mut map, file);
-}
-
-fn count_index_records(file_size: u64) -> usize {
-    if file_size <= INDEX_HEADER as u64 {
-        return 0;
-    }
-    // Lower bound: smallest record is an empty coarse column.
-    (file_size - INDEX_HEADER as u64).div_ceil(RECORD_HEADER as u64) as usize
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(tmp, &path)?;
+    OpenOptions::new().append(true).open(path)
 }
 
 fn write_index_header(file: &mut File, key: u64) -> std::io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
     file.write_all(INDEX_MAGIC)?;
     file.write_all(&INDEX_FORMAT.to_le_bytes())?;
     file.write_all(&key.to_le_bytes())?;
@@ -419,6 +378,25 @@ mod tests {
         assert_eq!(store.stamps(), vec![((1, 2), 99)]);
         assert!(store.coarse((1, 2)).is_some());
         assert!(store.columns((1, 2)).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrites_past_compaction_survive_reopen() {
+        let dir = temp_dir("compact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cols = chunk_columns(1);
+        {
+            let store = Store::open(dir.clone(), 5).unwrap();
+            for round in 1..=3 {
+                for i in 0..600 {
+                    store.put((i, -i), round, &cols, coarse_for(&cols));
+                }
+            }
+        }
+        let store = Store::open(dir.clone(), 5).unwrap();
+        assert_eq!(store.len(), 600);
+        assert!(store.stamps().iter().all(|&(_, ts)| ts == 3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

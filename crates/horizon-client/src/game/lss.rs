@@ -62,7 +62,7 @@ impl Game<'_> {
             log::info!(
                 "LSS: far terrain from the server {}, {} chunks",
                 if client.active() { "on" } else { "off" },
-                client.distance()
+                client.server_distance()
             );
         }
     }
@@ -118,6 +118,7 @@ impl Game<'_> {
         serde_json::json!({
             "active": client.active(),
             "distance": client.distance(),
+            "server_distance": client.server_distance(),
             "known": stats.session.known,
             "received": stats.session.received,
             "up_to_date": stats.session.up_to_date,

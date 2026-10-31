@@ -66,3 +66,9 @@ with Microsoft accounts
 The four-square Microsoft symbol in `launcher/src/microsoft.rs` reproduces the squares, positions and
 colours of Microsoft's official `ms-symbollockup_mssymbol_19.svg` from that page, unmodified. Microsoft
 and its logo are trademarks of the Microsoft group of companies; Horizon is not endorsed by Microsoft.
+
+## LOD Server Support
+
+`crates/horizon-client-render/src/lss/` speaks the wire protocol of
+[LOD Server Support](https://github.com/VoX/lod-server-support) (MIT, Copyright (c) 2026 VoX), and
+the column fixtures in `crates/horizon-client-render/src/lss/testdata/` come from its test corpus.

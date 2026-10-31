@@ -138,6 +138,11 @@ impl Session {
         effective_distance(self.inner.server_lod, self.inner.client_distance)
     }
 
+    /// The distance the server offers in this level, before the client's cap.
+    pub fn server_distance(&self) -> i32 {
+        self.inner.server_lod
+    }
+
     pub fn on_column(&mut self, dimension: &str, pos: (i32, i32), timestamp: i64) -> bool {
         if self.inner.dimension.as_deref() != Some(dimension) {
             return false;

@@ -192,6 +192,10 @@ impl Client {
         self.session.distance()
     }
 
+    pub fn server_distance(&self) -> i32 {
+        self.session.server_distance()
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             session: self.session.stats(),
