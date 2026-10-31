@@ -374,6 +374,8 @@ pub(super) struct Remote {
     pub quiet_commands: bool,
     /// The server announced it carries mod messages.
     pub mod_net: bool,
+    /// Far terrain from a server running LOD Server Support.
+    pub(super) lss: Option<horizon_client::lss::client::Client>,
     pub(super) builtin: Arc<Builtin>,
     lang: Arc<Language>,
     pub(super) registries: Arc<Dynamic>,
@@ -877,6 +879,7 @@ impl Game<'_> {
             brand: "unknown".into(),
             quiet_commands: false,
             mod_net: false,
+            lss: None,
             builtin: Arc::new(builtin),
             status: lang
                 .get("connect.connecting")
@@ -1983,6 +1986,11 @@ impl Game<'_> {
                 r.chunk_center = (0, 0);
             }
             self.clear_lod();
+            self.lss_enter(horizon_client::lss::client::Dimension {
+                name: spawn.dimension.clone(),
+                layout: shape.column(),
+                sky_light: shape.sky_light,
+            });
             self.pending_uploads.clear();
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.clear_sections(self.world.layout());
@@ -2772,6 +2780,9 @@ impl Game<'_> {
             C::CustomPayload(p) if p.channel == horizon_protocol::mod_net::CHANNEL => {
                 self.remote_native_net(&p.data);
             }
+            C::CustomPayload(p) if p.channel.starts_with("lss:") => {
+                self.lss_payload(&p.channel, &p.data);
+            }
             // PingDebugMonitor.onPongReceived.
             C::PongResponse(p) => {
                 let delay = self.debug_millis() - p.time;
@@ -2806,6 +2817,7 @@ impl Game<'_> {
                 }
                 self.streaming.radius =
                     self.settings.render_distance.min(p.chunk_radius + 1).max(2);
+                self.lss_join();
                 // handleLogin: startWaitingForNewLevel(.., Reason.OTHER).
                 self.enter_remote_dimension(
                     &p.spawn,
@@ -5259,6 +5271,7 @@ impl Game<'_> {
     /// One client tick while connected (Minecraft.tick with a ClientLevel).
     pub(super) fn tick_remote(&mut self) -> Result<()> {
         self.tick_remote_level()?;
+        self.tick_lss();
         // Client mods tick on any server, single player's own included.
         self.native_net.to_server = 0;
         self.native_tick();

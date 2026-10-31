@@ -67,6 +67,30 @@ impl DiskCache {
             .is_some_and(|region| region.index.contains_key(&(x, z)))
     }
 
+    /// Appends a new record and points the index at it (latest wins).
+    pub fn replace(&self, x: i32, z: i32, columns: &[Column; 256]) {
+        let bytes = encode(columns);
+        let Ok(mut regions) = self.regions.lock() else {
+            return;
+        };
+        let Some(region) = self.region(&mut regions, x, z, true) else {
+            return;
+        };
+        let mut record = Vec::with_capacity(RECORD as usize + bytes.len());
+        record.extend_from_slice(&x.to_le_bytes());
+        record.extend_from_slice(&z.to_le_bytes());
+        record.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        record.extend_from_slice(&bytes);
+        let Ok(end) = region.file.seek(SeekFrom::End(0)) else {
+            return;
+        };
+        if region.file.write_all(&record).is_ok() {
+            region
+                .index
+                .insert((x, z), (end + RECORD, bytes.len() as u32));
+        }
+    }
+
     /// Writes a chunk not cached yet. One already cached stays as it is: the
     /// build key clears stale ones, and a generation batch hands back
     /// neighbours cached before, which appended again grew the files each
@@ -192,30 +216,83 @@ pub fn build_key(states: usize, biomes: usize) -> u64 {
     hasher.finish()
 }
 
+pub(crate) fn encode_column(out: &mut Vec<u8>, column: &Column) {
+    match column.surface {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1 + u8::from(s.water.is_some()));
+            out.extend_from_slice(&s.height.to_le_bytes());
+            out.extend_from_slice(&s.state.0.to_le_bytes());
+            out.extend_from_slice(&s.biome.to_le_bytes());
+            if let Some((height, state)) = s.water {
+                out.extend_from_slice(&height.to_le_bytes());
+                out.extend_from_slice(&state.0.to_le_bytes());
+            }
+        }
+    }
+    out.extend_from_slice(&(column.spans.len() as u16).to_le_bytes());
+    for span in &column.spans {
+        out.extend_from_slice(&span.min.to_le_bytes());
+        out.extend_from_slice(&span.max.to_le_bytes());
+        out.extend_from_slice(&span.state.0.to_le_bytes());
+        out.extend_from_slice(&span.biome.to_le_bytes());
+        out.extend_from_slice(&span.light.to_le_bytes());
+    }
+}
+
+pub(crate) fn decode_column(raw: &[u8], at: &mut usize) -> Option<Column> {
+    let mut take = |n: usize| {
+        let field = raw.get(*at..*at + n)?;
+        *at += n;
+        Some(field)
+    };
+    let i32_ = |b: &[u8]| i32::from_le_bytes(b.try_into().unwrap());
+    let u32_ = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
+    let u16_ = |b: &[u8]| u16::from_le_bytes(b.try_into().unwrap());
+    let i16_ = |b: &[u8]| i16::from_le_bytes(b.try_into().unwrap());
+    let mut column = Column::default();
+    let tag = take(1)?[0];
+    if tag > 2 {
+        return None;
+    }
+    if tag > 0 {
+        let height = i32_(take(4)?);
+        let state = BlockStateId(u32_(take(4)?));
+        let biome = u16_(take(2)?);
+        let water = if tag == 2 {
+            Some((i32_(take(4)?), BlockStateId(u32_(take(4)?))))
+        } else {
+            None
+        };
+        column.surface = Some(Surface {
+            height,
+            state,
+            water,
+            biome,
+        });
+    }
+    let count = u16_(take(2)?);
+    column.spans.reserve(count.into());
+    for _ in 0..count {
+        let span = Span {
+            min: i16_(take(2)?),
+            max: i16_(take(2)?),
+            state: BlockStateId(u32_(take(4)?)),
+            biome: u16_(take(2)?),
+            light: u16_(take(2)?),
+        };
+        if span.min >= span.max {
+            return None;
+        }
+        column.spans.push(span);
+    }
+    Some(column)
+}
+
 fn encode(columns: &[Column; 256]) -> Vec<u8> {
     let mut out = Vec::new();
     for column in columns {
-        match column.surface {
-            None => out.push(0),
-            Some(s) => {
-                out.push(1 + u8::from(s.water.is_some()));
-                out.extend_from_slice(&s.height.to_le_bytes());
-                out.extend_from_slice(&s.state.0.to_le_bytes());
-                out.extend_from_slice(&s.biome.to_le_bytes());
-                if let Some((height, state)) = s.water {
-                    out.extend_from_slice(&height.to_le_bytes());
-                    out.extend_from_slice(&state.0.to_le_bytes());
-                }
-            }
-        }
-        out.extend_from_slice(&(column.spans.len() as u16).to_le_bytes());
-        for span in &column.spans {
-            out.extend_from_slice(&span.min.to_le_bytes());
-            out.extend_from_slice(&span.max.to_le_bytes());
-            out.extend_from_slice(&span.state.0.to_le_bytes());
-            out.extend_from_slice(&span.biome.to_le_bytes());
-            out.extend_from_slice(&span.light.to_le_bytes());
-        }
+        encode_column(&mut out, column);
     }
     let mut deflate =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -231,52 +308,9 @@ fn decode(bytes: &[u8]) -> Option<[Column; 256]> {
         .read_to_end(&mut raw)
         .ok()?;
     let mut at = 0;
-    let mut take = |n: usize| {
-        let field = raw.get(at..at + n)?;
-        at += n;
-        Some(field)
-    };
     let mut columns: [Column; 256] = std::array::from_fn(|_| Column::default());
     for column in &mut columns {
-        let i32_ = |b: &[u8]| i32::from_le_bytes(b.try_into().unwrap());
-        let u32_ = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
-        let u16_ = |b: &[u8]| u16::from_le_bytes(b.try_into().unwrap());
-        let i16_ = |b: &[u8]| i16::from_le_bytes(b.try_into().unwrap());
-        let tag = take(1)?[0];
-        if tag > 2 {
-            return None;
-        }
-        if tag > 0 {
-            let height = i32_(take(4)?);
-            let state = BlockStateId(u32_(take(4)?));
-            let biome = u16_(take(2)?);
-            let water = if tag == 2 {
-                Some((i32_(take(4)?), BlockStateId(u32_(take(4)?))))
-            } else {
-                None
-            };
-            column.surface = Some(Surface {
-                height,
-                state,
-                water,
-                biome,
-            });
-        }
-        let count = u16_(take(2)?);
-        column.spans.reserve(count.into());
-        for _ in 0..count {
-            let span = Span {
-                min: i16_(take(2)?),
-                max: i16_(take(2)?),
-                state: BlockStateId(u32_(take(4)?)),
-                biome: u16_(take(2)?),
-                light: u16_(take(2)?),
-            };
-            if span.min >= span.max {
-                return None;
-            }
-            column.spans.push(span);
-        }
+        *column = decode_column(&raw, &mut at)?;
     }
     (at == raw.len()).then_some(columns)
 }
@@ -343,6 +377,21 @@ mod tests {
         cache.put(5, -40, &columns(3));
         assert!(cache.get(4, -40).is_none());
         assert_eq!(*cache.get(5, -40).unwrap(), columns(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_latest_wins_and_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("horizon-lod-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = DiskCache::new(dir.clone(), 9);
+        cache.replace(1, 2, &columns(0));
+        assert_eq!(*cache.get(1, 2).unwrap(), columns(0));
+        cache.replace(1, 2, &columns(1));
+        assert_eq!(*cache.get(1, 2).unwrap(), columns(1));
+        drop(cache);
+        let cache = DiskCache::new(dir.clone(), 9);
+        assert_eq!(*cache.get(1, 2).unwrap(), columns(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

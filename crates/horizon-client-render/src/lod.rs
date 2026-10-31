@@ -379,7 +379,7 @@ impl Column {
     }
 }
 /// A chunk's 256 columns (`Column::from_chunk`), on the far-terrain worker.
-fn summarize(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
+pub fn summarize(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
     let water = water_source(kinds);
     Arc::new(std::array::from_fn(|i| {
         Column::from_chunk(chunk, kinds, water, (i & 15) as i32, (i >> 4) as i32)
@@ -404,7 +404,7 @@ const AIR: u8 = 4;
 const WATERY: u8 = 8;
 /// What `Column::from_chunk` needs of each block state, read from the facts
 /// once: matching their names for every block made observing a chunk slow.
-fn state_kinds(facts: &BlockFacts) -> Vec<u8> {
+pub fn state_kinds(facts: &BlockFacts) -> Vec<u8> {
     (0..facts.states.len())
         .map(|i| {
             let state = BlockStateId(i as u32);
@@ -442,6 +442,24 @@ fn nearly_full(name: &str) -> bool {
             | "minecraft:farmland"
             | "minecraft:honey_block"
     ) || name.ends_with("_stairs")
+}
+/// A chunk-wide silhouette for the coarsest tiles: reduced 16×16 footprint,
+/// the four highest spans, with the lowest of those reaching down to the true
+/// floor so distant terrain does not float.
+pub fn coarse(columns: &[Column; 256]) -> Column {
+    let floor = columns
+        .iter()
+        .flat_map(|column| column.spans.iter())
+        .map(|span| span.min)
+        .min();
+    let mut column = Column::reduced(columns, 0, 0, 16);
+    if column.spans.len() > 4 {
+        column.spans.drain(0..column.spans.len() - 4);
+    }
+    if let (Some(floor), Some(lowest)) = (floor, column.spans.first_mut()) {
+        lowest.min = floor;
+    }
+    column
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileKey {
@@ -673,7 +691,7 @@ struct MeshInput {
     neighbors: [Vec<EdgeSource>; 4],
     finer: Vec<TileKey>,
 }
-struct ReducedColumns {
+pub struct ReducedColumns {
     columns: Arc<[Column; 256]>,
     levels: [Vec<Column>; 4],
 }
@@ -703,7 +721,7 @@ impl MeshInput {
     }
 }
 impl ReducedColumns {
-    fn new(columns: Arc<[Column; 256]>) -> Self {
+    pub fn new(columns: Arc<[Column; 256]>) -> Self {
         let levels = std::array::from_fn(|level| {
             let width = 2 << level;
             (0..16 / width)
@@ -1561,6 +1579,34 @@ impl Lod {
             self.refresh_ready(fine, existed);
         }
     }
+    /// Horizontal cell range `[x0, x1) × [z0, z1)` in a ready tile that a
+    /// chunk `(cx, cz)` touches at `level`.
+    pub(crate) fn chunk_cells_in_tile(
+        cx: i32,
+        cz: i32,
+        key: TileKey,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let [ox, _, oz] = key.origin();
+        let stride = key.size() / 16;
+        let x0 = ((cx * 16 - ox + stride - 1).div_euclid(stride)).clamp(0, 16) as usize;
+        let x1 = (((cx + 1) * 16 - ox + stride - 1).div_euclid(stride)).clamp(0, 16) as usize;
+        let z0 = ((cz * 16 - oz + stride - 1).div_euclid(stride)).clamp(0, 16) as usize;
+        let z1 = (((cz + 1) * 16 - oz + stride - 1).div_euclid(stride)).clamp(0, 16) as usize;
+        (x0 < x1 && z0 < z1).then_some((x0, x1, z0, z1))
+    }
+    /// Sample grid cell in `key` that covers chunk corner `(cx * 16, cz * 16)`.
+    pub(crate) fn chunk_corner_cell(cx: i32, cz: i32, key: TileKey) -> Option<usize> {
+        let [ox, _, oz] = key.origin();
+        let stride = key.size() / 16;
+        if cx * 16 != ox + (cx * 16 - ox).div_euclid(stride) * stride
+            || cz * 16 != oz + (cz * 16 - oz).div_euclid(stride) * stride
+        {
+            return None;
+        }
+        let x = (cx * 16 - ox).div_euclid(stride) as usize;
+        let z = (cz * 16 - oz).div_euclid(stride) as usize;
+        (x < 16 && z < 16).then_some(z * 16 + x)
+    }
     fn apply_detail(&mut self, (cx, cz): (i32, i32), columns: &ReducedColumns) {
         self.apply_fine((cx, cz), &columns.columns);
         let mut modified = Vec::new();
@@ -1577,24 +1623,20 @@ impl Lod {
             let Some(samples) = self.ready.get_mut(&key) else {
                 continue;
             };
+            let Some((x0, x1, z0, z1)) = Self::chunk_cells_in_tile(cx, cz, key) else {
+                continue;
+            };
             let [ox, _, oz] = key.origin();
             let stride = key.size() / 16;
-            let x0 = ((cx * 16 - ox + stride - 1).div_euclid(stride)).clamp(0, 16);
-            let x1 = (((cx + 1) * 16 - ox + stride - 1).div_euclid(stride)).clamp(0, 16);
-            let z0 = ((cz * 16 - oz + stride - 1).div_euclid(stride)).clamp(0, 16);
-            let z1 = (((cz + 1) * 16 - oz + stride - 1).div_euclid(stride)).clamp(0, 16);
-            if x0 == x1 || z0 == z1 {
-                continue;
-            }
             let samples = Arc::make_mut(samples);
             let mask = self.detail_masks.entry(key).or_default();
             for z in z0..z1 {
                 for x in x0..x1 {
-                    let index = (z * 16 + x) as usize;
+                    let index = z * 16 + x;
                     samples[index] = columns
                         .get(
-                            (ox + x * stride).rem_euclid(16) as usize,
-                            (oz + z * stride).rem_euclid(16) as usize,
+                            (ox + x as i32 * stride).rem_euclid(16) as usize,
+                            (oz + z as i32 * stride).rem_euclid(16) as usize,
                             stride as usize,
                         )
                         .clone();
@@ -1606,6 +1648,64 @@ impl Lod {
         for key in modified {
             self.mark_data_changed(key);
         }
+    }
+    /// A chunk's columns streamed from a server, into every ready tile they
+    /// show in: real detail up to level 3, `coarse` above.
+    pub fn apply_columns(&mut self, pos: (i32, i32), columns: &ReducedColumns, coarse: &Column) {
+        let (cx, cz) = pos;
+        if !self.saved.contains_key(&pos) {
+            self.apply_fine(pos, &columns.columns);
+            for level in 0..=3u8 {
+                let size = 16 << level;
+                let key = TileKey {
+                    x: (cx * 16).div_euclid(size),
+                    z: (cz * 16).div_euclid(size),
+                    level,
+                };
+                let Some(samples) = self.ready.get_mut(&key) else {
+                    continue;
+                };
+                let Some((x0, x1, z0, z1)) = Self::chunk_cells_in_tile(cx, cz, key) else {
+                    continue;
+                };
+                let [ox, _, oz] = key.origin();
+                let stride = key.size() / 16;
+                let samples = Arc::make_mut(samples);
+                let mask = self.detail_masks.entry(key).or_default();
+                for z in z0..z1 {
+                    for x in x0..x1 {
+                        let index = z * 16 + x;
+                        samples[index] = columns
+                            .get(
+                                (ox + x as i32 * stride).rem_euclid(16) as usize,
+                                (oz + z as i32 * stride).rem_euclid(16) as usize,
+                                stride as usize,
+                            )
+                            .clone();
+                        mask[index / 64] |= 1 << (index % 64);
+                    }
+                }
+            }
+        }
+        for level in 4..=MAX_LEVEL {
+            let size = 16 << level;
+            let key = TileKey {
+                x: (cx * 16).div_euclid(size),
+                z: (cz * 16).div_euclid(size),
+                level,
+            };
+            let Some(samples) = self.ready.get_mut(&key) else {
+                continue;
+            };
+            let Some(index) = Self::chunk_corner_cell(cx, cz, key) else {
+                continue;
+            };
+            let samples = Arc::make_mut(samples);
+            samples[index] = coarse.clone();
+            self.detail_masks.entry(key).or_default()[index / 64] |= 1 << (index % 64);
+        }
+        self.invalidate_chunk(cx, cz);
+        self.reselect = true;
     }
     fn finish_sample(&mut self, key: TileKey, samples: Vec<Column>) {
         self.pending.remove(&key);
@@ -2758,6 +2858,65 @@ mod tests {
         );
         assert_eq!(kelp.surface.unwrap().water, Some((63, BlockStateId(2))));
         assert_eq!(kelp.surface.unwrap().height, 40);
+    }
+    #[test]
+    fn coarse_keeps_top_four_spans_and_reaches_floor() {
+        let span = |min, max, state| Span {
+            min,
+            max,
+            state: BlockStateId(state),
+            biome: 0,
+            light: 240,
+        };
+        let mut columns = std::array::from_fn(|_| Column {
+            surface: None,
+            spans: vec![span(-60, -50, 1), span(-40, -30, 2), span(-20, -10, 3)],
+        });
+        for i in 0..256 {
+            columns[i].spans.push(span(0, 10, 4));
+            columns[i].spans.push(span(20, 30, 5));
+            columns[i].spans.push(span(40, 50, 6));
+            columns[i].spans.push(span(60, 70, 7));
+        }
+        let silhouette = coarse(&columns);
+        assert_eq!(silhouette.spans.len(), 4);
+        assert_eq!(silhouette.spans.first().unwrap().min, -60);
+        assert_eq!(
+            silhouette.spans.iter().map(|s| s.state).collect::<Vec<_>>(),
+            vec![
+                BlockStateId(4),
+                BlockStateId(5),
+                BlockStateId(6),
+                BlockStateId(7),
+            ]
+        );
+    }
+    #[test]
+    fn chunk_cell_index_math() {
+        let key = |cx: i32, cz: i32, level: u8| TileKey {
+            x: (cx * 16).div_euclid(16 << level),
+            z: (cz * 16).div_euclid(16 << level),
+            level,
+        };
+        assert_eq!(
+            super::Lod::chunk_cells_in_tile(0, 0, key(0, 0, 0)),
+            Some((0, 16, 0, 16))
+        );
+        assert_eq!(
+            super::Lod::chunk_cells_in_tile(-1, -1, key(-1, -1, 0)),
+            Some((0, 16, 0, 16))
+        );
+        assert_eq!(
+            super::Lod::chunk_cells_in_tile(0, 0, key(0, 0, 3)),
+            Some((0, 2, 0, 2))
+        );
+        assert_eq!(super::Lod::chunk_corner_cell(0, 0, key(0, 0, 4)), Some(0));
+        assert_eq!(super::Lod::chunk_corner_cell(1, 2, key(1, 2, 4)), Some(33));
+        assert_eq!(
+            super::Lod::chunk_corner_cell(-1, -1, key(-1, -1, 4)),
+            Some(255)
+        );
+        assert_eq!(super::Lod::chunk_corner_cell(0, 0, key(0, 0, 7)), Some(0));
     }
     #[test]
     fn coarse_voxels_reduce_the_area_instead_of_inflating_one_leaf() {

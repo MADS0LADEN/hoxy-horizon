@@ -170,6 +170,7 @@ mod lightning;
 mod llamas;
 mod locator_bar;
 mod loom;
+mod lss;
 mod mace;
 mod machines;
 mod maps;
@@ -14916,11 +14917,16 @@ impl Game<'_> {
         }
         Ok(())
     }
-    /// LOD Distance and Far Detail Reduced as the player chose them.
+    /// LOD Distance and Far Detail Reduced as the player chose them. With
+    /// LOD Distance off, a server streaming far terrain (LSS) picks the
+    /// distance, as Voxy draws it whatever vanilla's options say.
     fn far_terrain_choice(&self) -> (u32, bool) {
         let g = &self.settings.horizon;
         let reduced = g.far_detail == horizon_client::graphics::FarDetail::Reduced;
-        (g.lod_distance, reduced)
+        match self.lss_active() {
+            Some(lss) if g.lod_distance == 0 => (lss.distance().max(0) as u32, reduced),
+            _ => (g.lod_distance, reduced),
+        }
     }
     /// LOD Distance as far terrain uses it (`graphics::lod_distance_capped`).
     fn lod_distance(&self) -> u32 {
@@ -14955,7 +14961,7 @@ impl Game<'_> {
             && self.renderer.is_some()
             && self.player.is_some()
             && self.title.is_none()
-            && (self.remote.is_none() || self.integrated.is_some());
+            && (self.remote.is_none() || self.integrated.is_some() || self.lss_active().is_some());
         if !enabled {
             if self.lod.is_some() || self.lod_source_attempted {
                 self.clear_lod();
@@ -14969,7 +14975,10 @@ impl Game<'_> {
         let dim = self.dim;
         let source = match &self.integrated {
             Some(server) => server.call(move |game| game.lod_source_in(dim)).flatten(),
-            None => Some(self.streaming.lod_source()),
+            None => match self.lss_active() {
+                Some(lss) => lss.source(),
+                None => Some(self.streaming.lod_source()),
+            },
         };
         if let Some(source) = source {
             self.lod = Some(horizon_client::lod::Lod::new(
@@ -14984,6 +14993,7 @@ impl Game<'_> {
             log::warn!("Horizon: {e}");
         }
         self.prepare_lod();
+        self.lss_apply();
         if self.lod.is_some() {
             for &((x, _, z), _, _) in &self.world.light_edits {
                 self.lod_observe.insert((x >> 4, z >> 4));

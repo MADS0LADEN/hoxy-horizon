@@ -10,6 +10,12 @@
 //!   to a `Chunk`, which `lod` summarizes into far-terrain columns.
 //! - `session`: the client's want-set: which columns to ask for, with which
 //!   timestamps, and what the answers mean.
+//! - `store`: on-disk columns and a far-terrain sampler for one dimension.
+//! - `ingest`: background decode of voxel columns into the store.
+//! - `client`: session, store, ingest, and payloads for the game.
+pub mod client;
+pub mod ingest;
 pub mod section;
 pub mod session;
+pub mod store;
 pub mod wire;
