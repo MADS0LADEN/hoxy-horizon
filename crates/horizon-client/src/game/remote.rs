@@ -376,6 +376,9 @@ pub(super) struct Remote {
     pub mod_net: bool,
     /// Far terrain from a server running LOD Server Support.
     pub(super) lss: Option<horizon_client::lss::client::Client>,
+    /// The level's key (`minecraft:overworld`, a multiworld's `minecraft:event`):
+    /// a server's worlds can share a dimension type, and each is its own level.
+    level_key: String,
     pub(super) builtin: Arc<Builtin>,
     lang: Arc<Language>,
     pub(super) registries: Arc<Dynamic>,
@@ -880,6 +883,7 @@ impl Game<'_> {
             quiet_commands: false,
             mod_net: false,
             lss: None,
+            level_key: String::new(),
             builtin: Arc::new(builtin),
             status: lang
                 .get("connect.connecting")
@@ -1911,7 +1915,11 @@ impl Game<'_> {
             dimension.has_skylight,
         )
         .unwrap_or_else(|_| super::Dim::from_id(&dimension.name).shape());
-        let same = r.dimension.name == dimension.name && keep_world;
+        // ClientPacketListener.handleRespawn: a new ClientLevel whenever the
+        // level's key differs, even between worlds of one dimension type.
+        let same =
+            r.dimension.name == dimension.name && r.level_key == spawn.dimension && keep_world;
+        r.level_key = spawn.dimension.clone();
         r.chunk_format = Arc::new(
             r.chunk_format
                 .with_dimension(&dimension)
